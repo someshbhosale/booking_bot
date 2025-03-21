@@ -18,13 +18,17 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL"))  # Check every 10 seconds
 
 # ------------------- STEP 2: Set Up Selenium -------------------
 chrome_options = Options()
-chrome_options.add_argument("--headless")  # Run in headless mode
+chrome_options.add_argument("--headless")  # Run headless
 chrome_options.add_argument("--disable-gpu")
 chrome_options.add_argument("--window-size=1920,1080")
 chrome_options.add_argument("--no-sandbox")
 chrome_options.add_argument("--disable-dev-shm-usage")
-chrome_options.binary_location = "/usr/bin/chromium-browser"
-service = Service(ChromeDriverManager().install())
+
+# Use Railway's Chromium Path
+chrome_options.binary_location = "/usr/bin/chromium"
+
+# Set WebDriver Path
+service = Service("/usr/bin/chromedriver")
 
 def fetch_matches():
     """Scrapes match data from the website and returns a list of matches."""
