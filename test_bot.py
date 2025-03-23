@@ -15,7 +15,8 @@ matches_db = []  # In-memory storage for match data
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL"))  # Check every 10 seconds
+# CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL"))  # Check every 10 seconds
+CHECK_INTERVAL = 900
 
 # ------------------- STEP 2: Set Up Selenium -------------------
 chrome_options = Options()
