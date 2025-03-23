@@ -8,6 +8,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 from dotenv import load_dotenv
+from datetime import datetime
 
 # ------------------- STEP 1: Initialize Variables -------------------
 matches_db = []  # In-memory storage for match data
@@ -74,5 +75,7 @@ while True:
             send_telegram_message(match)
             print(f"✅ New Match Added: {match['team1']} vs {match['team2']} on {match['date']}")
         
-    print(f"No New Match Found")
+    # Get the current timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] No New Match Found")
     time.sleep(CHECK_INTERVAL)  # Wait before checking again
