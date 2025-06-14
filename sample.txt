@@ -1,38 +1,118 @@
-package com.example.microservice;
-import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.http.client.reactive.ReactorClientHttpConnector;
-import org.springframework.web.reactive.function.client.WebClient;
-import reactor.netty.http.client.HttpClient;
+static void revertClientByEmail(String emailId,
+                                    MongoCollection<Contact> contactCollection,
+                                    MongoCollection<Client> clientCollection,
+                                    MongoCollection<Document> configCollection) {
 
-import javax.net.ssl.SSLException;
+        Contact contact1 = contactCollection.find(Filters.eq("_id", emailId)).first();
+        if (contact1 == null || contact1.getCustomerId() == null) {
+            System.err.println("❌ No valid contact or customerId found for: " + emailId);
+            return;
+        }
 
-@Configuration
-public class WebClientConfig {
+        String customerId = contact1.getCustomerId();
+        List<Contact> relatedContacts = contactCollection.find(Filters.eq("customerId", customerId)).into(new ArrayList<>());
+        if(relatedContacts.size() == 1) {
+            // ✅ Scenario 1: Single Contact → Revert `_id`
+            Contact contact = relatedContacts.get(0);
+            Client existingClient = clientCollection.find(Filters.eq("_id", customerId)).first();
+            if (existingClient != null) {
+                try {
+                    existingClient.setId(contact.getUserId());
+                    // Delete existing client
+                    clientCollection.deleteOne(Filters.eq("_id", customerId));
+                    System.out.println("🗑️ Deleted client with Customer _id for Pattern 1 and Pattern 2: " + customerId);
 
-    @Bean
-    public WebClient soapWebClient() throws SSLException {
-        // Create insecure Netty SSL context (trust all)
-        HttpClient httpClient = HttpClient.create()
-                .secure(sslContextSpec -> {
-                    try {
-                        sslContextSpec.sslContext(
-                                SslContextBuilder
-                                        .forClient()
-                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
-                                        .build()
-                        );
-                    } catch (SSLException e) {
-                        throw new RuntimeException("Failed to create SSL context", e);
-                    }
-                });
+                    // Insert updated client
+                    insertClientSafely(clientCollection, existingClient);
+                    System.out.println("✅ Inserted client with Updated Email _id: " + contact.getUserId());
+                    removeCustomerIdFromContact(contactCollection, contact.getUserId());
+                } catch (MongoWriteException e) {
+                    System.err.println("❌ Error updating client Email _id for customerId: " + customerId + " → " + e.getMessage());
+                }
 
-        return WebClient.builder()
-                .clientConnector(new ReactorClientHttpConnector(httpClient))
-                .baseUrl("")  // Replace this
-                .defaultHeader("Content-Type", "text/xml;charset=UTF-8")
-                .build();
+            }
+        }
+        else{
+            Client mergedClient = clientCollection.find(Filters.eq("_id", customerId)).first();
+
+            if (mergedClient == null) {
+                System.err.println("❌ No merged client found for customerId: " + customerId);
+                return;
+            }
+
+            // Reinsert split clients
+            for (Contact con : relatedContacts) {
+                if(con.getUserId().equals(emailId)){
+                    List<Document> configs = getConfigurationsByUserId(configCollection, con.getUserId());
+                    List<String> configIds = configs.stream().map(d -> d.get("_id").toString()).collect(Collectors.toList());
+                    List<ImageData> images = filterImagesFromConfig(configs, mergedClient.getImageData());
+                    List<ImageData> certificates = filterCertificatesFromConfig(configs, mergedClient.getCertificateData());
+                    Client newClient = new Client(con.getUserId(), configIds, certificates, images, mergedClient.getAssignments(), mergedClient.isValidated());
+                    insertClientSafely(clientCollection, newClient);
+                    removeCustomerIdFromContact(contactCollection, con.getUserId());
+                }
+            }
+            // Delete merged client
+//            try {
+//                clientCollection.deleteOne(Filters.eq("_id", customerId));
+//                System.out.println("🗑️ Deleted merged client with _id: " + customerId);
+//            } catch (MongoWriteException e) {
+//                System.err.println("❌ Failed to delete merged client: " + e.getMessage());
+//            }
+        }
     }
-}
+
+    static boolean doesClientExist(MongoCollection<Client> collection, String id) {
+        if(collection.find(Filters.eq("_id", id)).first() != null){
+            collection.deleteOne(Filters.eq("_id", id));
+        }
+        return false;
+    }
+
+    static void insertClientSafely(MongoCollection<Client> collection, Client client) {
+        if (!doesClientExist(collection, client.getId())) {
+            try {
+                collection.insertOne(client);
+                System.out.println("✅ Inserted client: " + client.getId());
+            } catch (MongoWriteException e) {
+                System.err.println("❌ Error inserting client: " + client.getId() + " → " + e.getMessage());
+            }
+        } else {
+            System.out.println("ℹ️ Client already exists: " + client.getId());
+        }
+    }
+
+    static void removeCustomerIdFromContact(MongoCollection<Contact> contactCollection, String userId) {
+        contactCollection.updateOne(Filters.eq("_id", userId), new Document("$unset", new Document("customerId", "")));
+        System.out.println("🧹 Removed customerId from contact: " + userId);
+    }
+
+    static List<Document> getConfigurationsByUserId(MongoCollection<Document> configCollection, String userId) {
+        return configCollection.find(Filters.eq("createdBy", userId)).into(new ArrayList<>());
+    }
+
+    static List<ImageData> filterCertificatesFromConfig(List<Document> configs, List<ImageData> allCertificates) {
+        Set<String> certIds = new HashSet<>();
+        for (Document doc : configs) {
+            Document data = doc.get("data", Document.class);
+            if (data != null && data.containsKey("certificateData")) {
+                List<String> certList = data.getList("certificateData", String.class);
+                certIds.addAll(certList);
+            }
+        }
+        return allCertificates.stream().filter(img -> certIds.contains(img.getId())).collect(Collectors.toList());
+    }
+
+    static List<ImageData> filterImagesFromConfig(List<Document> configs, List<ImageData> allImages) {
+        Set<String> imageIds = new HashSet<>();
+        for (Document doc : configs) {
+            Document data = doc.get("data", Document.class);
+            if (data != null) {
+                Document generalSettings = data.get("generalDeviceSettings", Document.class);
+                if (generalSettings != null && generalSettings.containsKey("imageId")) {
+                    imageIds.add(generalSettings.getString("imageId"));
+                }
+            }
+        }
+        return allImages.stream().filter(img -> imageIds.contains(img.getId())).collect(Collectors.toList());
+    }
