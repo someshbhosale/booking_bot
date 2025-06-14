@@ -1,118 +1,148 @@
-static void revertClientByEmail(String emailId,
-                                    MongoCollection<Contact> contactCollection,
-                                    MongoCollection<Client> clientCollection,
-                                    MongoCollection<Document> configCollection) {
+import com.mongodb.*;
+import java.net.UnknownHostException;
+import java.util.*;
 
-        Contact contact1 = contactCollection.find(Filters.eq("_id", emailId)).first();
-        if (contact1 == null || contact1.getCustomerId() == null) {
+public class ClientRevertByEmail_DBObject {
+
+    public static void main(String[] args) throws UnknownHostException {
+        MongoClient mongoClient = new MongoClient("localhost", 27017);
+        DB db = mongoClient.getDB("customerVerification");
+
+        DBCollection contactCol = db.getCollection("contact");
+        DBCollection clientCol = db.getCollection("client");
+        DBCollection configCol = db.getCollection("configuration");
+
+        revertClientByEmail("john.doe@example.com", contactCol, clientCol, configCol);
+    }
+
+    static void revertClientByEmail(String emailId,
+                                    DBCollection contactCollection,
+                                    DBCollection clientCollection,
+                                    DBCollection configCollection) {
+
+        DBObject contact1 = contactCollection.findOne(new BasicDBObject("_id", emailId));
+        if (contact1 == null || contact1.get("customerId") == null) {
             System.err.println("❌ No valid contact or customerId found for: " + emailId);
             return;
         }
 
-        String customerId = contact1.getCustomerId();
-        List<Contact> relatedContacts = contactCollection.find(Filters.eq("customerId", customerId)).into(new ArrayList<>());
-        if(relatedContacts.size() == 1) {
-            // ✅ Scenario 1: Single Contact → Revert `_id`
-            Contact contact = relatedContacts.get(0);
-            Client existingClient = clientCollection.find(Filters.eq("_id", customerId)).first();
+        String customerId = contact1.get("customerId").toString();
+        List<DBObject> relatedContacts = new ArrayList<>();
+        DBCursor cursor = contactCollection.find(new BasicDBObject("customerId", customerId));
+        while (cursor.hasNext()) relatedContacts.add(cursor.next());
+
+        if (relatedContacts.size() == 1) {
+            // Pattern 1: Single contact → just update client _id
+            DBObject contact = relatedContacts.get(0);
+            DBObject existingClient = clientCollection.findOne(new BasicDBObject("_id", customerId));
             if (existingClient != null) {
-                try {
-                    existingClient.setId(contact.getUserId());
-                    // Delete existing client
-                    clientCollection.deleteOne(Filters.eq("_id", customerId));
-                    System.out.println("🗑️ Deleted client with Customer _id for Pattern 1 and Pattern 2: " + customerId);
+                String newId = contact.get("userId").toString();
+                existingClient.put("_id", newId);
 
-                    // Insert updated client
-                    insertClientSafely(clientCollection, existingClient);
-                    System.out.println("✅ Inserted client with Updated Email _id: " + contact.getUserId());
-                    removeCustomerIdFromContact(contactCollection, contact.getUserId());
-                } catch (MongoWriteException e) {
-                    System.err.println("❌ Error updating client Email _id for customerId: " + customerId + " → " + e.getMessage());
-                }
+                clientCollection.remove(new BasicDBObject("_id", customerId));
+                System.out.println("🗑️ Deleted client with Customer _id: " + customerId);
 
+                clientCollection.insert(existingClient);
+                System.out.println("✅ Inserted client with Updated Email _id: " + newId);
+
+                contactCollection.update(
+                    new BasicDBObject("_id", newId),
+                    new BasicDBObject("$unset", new BasicDBObject("customerId", ""))
+                );
+                System.out.println("🧹 Removed customerId from contact: " + newId);
             }
-        }
-        else{
-            Client mergedClient = clientCollection.find(Filters.eq("_id", customerId)).first();
-
+        } else {
+            // Pattern 2+: multiple related contacts → rebuild split clients
+            DBObject mergedClient = clientCollection.findOne(new BasicDBObject("_id", customerId));
             if (mergedClient == null) {
                 System.err.println("❌ No merged client found for customerId: " + customerId);
                 return;
             }
 
-            // Reinsert split clients
-            for (Contact con : relatedContacts) {
-                if(con.getUserId().equals(emailId)){
-                    List<Document> configs = getConfigurationsByUserId(configCollection, con.getUserId());
-                    List<String> configIds = configs.stream().map(d -> d.get("_id").toString()).collect(Collectors.toList());
-                    List<ImageData> images = filterImagesFromConfig(configs, mergedClient.getImageData());
-                    List<ImageData> certificates = filterCertificatesFromConfig(configs, mergedClient.getCertificateData());
-                    Client newClient = new Client(con.getUserId(), configIds, certificates, images, mergedClient.getAssignments(), mergedClient.isValidated());
-                    insertClientSafely(clientCollection, newClient);
-                    removeCustomerIdFromContact(contactCollection, con.getUserId());
+            for (DBObject con : relatedContacts) {
+                if (!emailId.equals(con.get("_id").toString())) continue;
+
+                String userId = con.get("userId").toString();
+                List<DBObject> configs = getConfigurationsByUserId(configCollection, userId);
+
+                List<String> configIds = new ArrayList<>();
+                for (DBObject cfg : configs) {
+                    Object id = cfg.get("_id");
+                    if (id != null) configIds.add(id.toString());
                 }
+
+                List<DBObject> images = filterImagesFromConfig(configs, toList(mergedClient.get("imageData")));
+                List<DBObject> certificates = filterCertificatesFromConfig(configs, toList(mergedClient.get("certificateData")));
+
+                DBObject newClient = new BasicDBObject();
+                newClient.put("_id", userId);
+                newClient.put("configurationIds", configIds);
+                newClient.put("imageData", images);
+                newClient.put("certificateData", certificates);
+                newClient.put("assignments", mergedClient.get("assignments"));
+                newClient.put("validated", mergedClient.get("validated"));
+
+                clientCollection.remove(new BasicDBObject("_id", userId));
+                clientCollection.insert(newClient);
+                System.out.println("✅ Inserted client: " + userId);
+
+                contactCollection.update(
+                    new BasicDBObject("_id", userId),
+                    new BasicDBObject("$unset", new BasicDBObject("customerId", ""))
+                );
+                System.out.println("🧹 Removed customerId from contact: " + userId);
             }
-            // Delete merged client
-//            try {
-//                clientCollection.deleteOne(Filters.eq("_id", customerId));
-//                System.out.println("🗑️ Deleted merged client with _id: " + customerId);
-//            } catch (MongoWriteException e) {
-//                System.err.println("❌ Failed to delete merged client: " + e.getMessage());
-//            }
+
+            // Optionally delete merged client afterwards:
+            clientCollection.remove(new BasicDBObject("_id", customerId));
+            System.out.println("🗑️ Deleted merged client with _id: " + customerId);
         }
     }
 
-    static boolean doesClientExist(MongoCollection<Client> collection, String id) {
-        if(collection.find(Filters.eq("_id", id)).first() != null){
-            collection.deleteOne(Filters.eq("_id", id));
-        }
-        return false;
+    static List<DBObject> getConfigurationsByUserId(DBCollection configCol, String userId) {
+        List<DBObject> list = new ArrayList<>();
+        DBCursor c = configCol.find(new BasicDBObject("createdBy", userId));
+        while (c.hasNext()) list.add(c.next());
+        return list;
     }
 
-    static void insertClientSafely(MongoCollection<Client> collection, Client client) {
-        if (!doesClientExist(collection, client.getId())) {
-            try {
-                collection.insertOne(client);
-                System.out.println("✅ Inserted client: " + client.getId());
-            } catch (MongoWriteException e) {
-                System.err.println("❌ Error inserting client: " + client.getId() + " → " + e.getMessage());
-            }
-        } else {
-            System.out.println("ℹ️ Client already exists: " + client.getId());
-        }
+    @SuppressWarnings("unchecked")
+    static List<DBObject> toList(Object obj) {
+        if (obj instanceof List) return (List<DBObject>) obj;
+        return Collections.emptyList();
     }
 
-    static void removeCustomerIdFromContact(MongoCollection<Contact> contactCollection, String userId) {
-        contactCollection.updateOne(Filters.eq("_id", userId), new Document("$unset", new Document("customerId", "")));
-        System.out.println("🧹 Removed customerId from contact: " + userId);
-    }
-
-    static List<Document> getConfigurationsByUserId(MongoCollection<Document> configCollection, String userId) {
-        return configCollection.find(Filters.eq("createdBy", userId)).into(new ArrayList<>());
-    }
-
-    static List<ImageData> filterCertificatesFromConfig(List<Document> configs, List<ImageData> allCertificates) {
+    static List<DBObject> filterCertificatesFromConfig(List<DBObject> configs, List<DBObject> allCertificates) {
         Set<String> certIds = new HashSet<>();
-        for (Document doc : configs) {
-            Document data = doc.get("data", Document.class);
-            if (data != null && data.containsKey("certificateData")) {
-                List<String> certList = data.getList("certificateData", String.class);
+        for (DBObject cfg : configs) {
+            Object d = cfg.get("data");
+            if (d instanceof DBObject && ((DBObject)d).containsField("certificateData")) {
+                List<String> certList = (List<String>)((DBObject)d).get("certificateData");
                 certIds.addAll(certList);
             }
         }
-        return allCertificates.stream().filter(img -> certIds.contains(img.getId())).collect(Collectors.toList());
+        return filterById(allCertificates, certIds, "id");
     }
 
-    static List<ImageData> filterImagesFromConfig(List<Document> configs, List<ImageData> allImages) {
-        Set<String> imageIds = new HashSet<>();
-        for (Document doc : configs) {
-            Document data = doc.get("data", Document.class);
-            if (data != null) {
-                Document generalSettings = data.get("generalDeviceSettings", Document.class);
-                if (generalSettings != null && generalSettings.containsKey("imageId")) {
-                    imageIds.add(generalSettings.getString("imageId"));
+    static List<DBObject> filterImagesFromConfig(List<DBObject> configs, List<DBObject> allImages) {
+        Set<String> imgIds = new HashSet<>();
+        for (DBObject cfg : configs) {
+            Object d = cfg.get("data");
+            if (d instanceof DBObject) {
+                DBObject gds = (DBObject)((DBObject)d).get("generalDeviceSettings");
+                if (gds != null && gds.get("imageId") != null) {
+                    imgIds.add(gds.get("imageId").toString());
                 }
             }
         }
-        return allImages.stream().filter(img -> imageIds.contains(img.getId())).collect(Collectors.toList());
+        return filterById(allImages, imgIds, "id");
     }
+
+    static List<DBObject> filterById(List<DBObject> items, Set<String> ids, String idField) {
+        List<DBObject> filtered = new ArrayList<>();
+        for (DBObject item : items) {
+            if (ids.contains(item.get(idField))) filtered.add(item);
+        }
+        return filtered;
+    }
+}
